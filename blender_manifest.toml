@@ -1,0 +1,20 @@
+schema_version = "1.0.0"
+
+id = "blenderkit_batch"
+type = "add-on"
+version = "1.0.0" # Initial version
+
+name = "BlenderKit Batch Operations"
+tagline = "Batch render thumbnails and upload models using BlenderKit"
+maintainer = "Your Name <your.email@example.com>" # TODO: Update maintainer info
+website = "www.blenderkit.com" # TODO: Add website if available
+
+tags = ["3D View", "BlenderKit"] # Added BlenderKit tag
+blender_version_min = "3.0.0" # Match bl_info
+
+license = ["SPDX:GPL-2.0-or-later",] # Assuming same license as BlenderKit
+copyright = ["2024 Your Name",] # TODO: Update copyright year and name
+
+[permissions]
+files = "Save temporary files for thumbnail generation"
+network = "Communicate with blenderkit.com via the main BlenderKit addon" 
