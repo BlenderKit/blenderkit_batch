@@ -64,106 +64,6 @@ except ImportError:
 # --- Helper Functions ---
 
 
-def _get_model_upload_data(model_object, context):
-    """Replicates parts of blenderkit.upload.get_upload_data for a specific model object."""
-    if not model_object or not hasattr(model_object, "blenderkit"):
-        print("BlenderKit Batch: Invalid model object passed to _get_model_upload_data")
-        return None, None
-
-    props = model_object.blenderkit
-    asset_type = "MODEL"  # Assuming model, could potentially check props.asset_type
-    export_data = {}
-    upload_data = {
-        "assetType": asset_type.lower(),
-        "asset_base_id": props.asset_base_id,  # Needed for re-uploads
-        "id": props.id,  # Needed for re-uploads
-    }
-    upload_params = {}
-
-    # --- Basic Info from Props ---
-    upload_data["displayName"] = props.name
-    upload_data["description"] = props.description
-    upload_data["tags"] = bk_utils.string2list(props.tags)
-
-    # Category logic (simplified from original)
-    if props.category == "" or props.category == "NONE":
-        upload_data["category"] = asset_type.lower()
-    else:
-        upload_data["category"] = props.category
-    if props.subcategory not in ("NONE", "EMPTY", "OTHER"):
-        upload_data["category"] = props.subcategory
-    if props.subcategory1 not in ("NONE", "EMPTY", "OTHER"):
-        upload_data["category"] = props.subcategory1
-
-    upload_data["isPrivate"] = props.is_private == "PRIVATE"
-    # Read plan from batch settings, not individual props
-    batch_props = context.scene.blenderkit_batch_props
-    upload_data["freeFull"] = batch_props.upload_plan
-    upload_data["license"] = (
-        props.license if props.is_private == "PUBLIC" else "PRIVATE"
-    )
-
-    # Content Flags
-    upload_data["sexualizedContent"] = props.sexualized_content
-    upload_data["nudityContent"] = props.nudity_content
-    upload_data["violenceContent"] = props.violence_content
-    upload_data["sensitiveContentComment"] = props.sensitive_content_comment
-
-    # --- Export Data --- (Paths and object names)
-    export_data["asset_name"] = model_object.name  # Used by client_lib?
-    export_data["thumbnail_path"] = ""
-    if props.thumbnail:
-        try:
-            export_data["thumbnail_path"] = bpy.path.abspath(props.thumbnail)
-        except Exception as e:
-            print(
-                f"BlenderKit Batch: Error resolving thumbnail path for {model_object.name}: {e}"
-            )
-            # Decide how to handle - fail, or continue without thumb path?
-
-    # Hierarchy
-    try:
-        obs = bk_utils.get_hierarchy(model_object)
-        obnames = [ob.name for ob in obs]
-        export_data["models"] = obnames
-    except Exception as e:
-        print(f"BlenderKit Batch: Error getting hierarchy for {model_object.name}: {e}")
-        return None, None  # Cannot proceed without hierarchy
-
-    # --- Upload Params --- (Counts, modifiers, etc.) - Simplified
-    # Calculating these accurately might require more context or checks.
-    # Let's try sending what's stored on props, assuming BK updated them.
-    upload_params["faceCount"] = props.face_count
-    upload_params["vertexCount"] = props.vertex_count
-    upload_params["materialCount"] = props.material_count
-    upload_params["objectCount"] = len(obnames)
-    upload_params["imageCount"] = props.image_count
-    upload_params["imageMemory"] = props.image_memory
-    upload_params["modifiers"] = bk_utils.string2list(props.modifiers)
-    upload_params["dimensions"] = [
-        props.dimension_x,
-        props.dimension_y,
-        props.dimension_z,
-    ]
-
-    # Add Blender version (important!)
-    bk_utils.add_version(upload_data)
-
-    # Merge upload_params into upload_data
-    upload_data["upload_params"] = upload_params
-
-    # --- Eval Paths (For progress reporting back to UI - maybe less relevant for batch?) ---
-    export_data["eval_path_computing"] = (
-        f"bpy.data.objects['{model_object.name}'].blenderkit.uploading"
-    )
-    export_data["eval_path_state"] = (
-        f"bpy.data.objects['{model_object.name}'].blenderkit.upload_state"
-    )
-    export_data["eval_path"] = f"bpy.data.objects['{model_object.name}']"
-
-    return export_data, upload_data
-
-
 def _trigger_thumbnail_render(model_name):
     """Gets called by the task queue to render a thumbnail for a specific model."""
     if not BLENDERKIT_AVAILABLE:
@@ -261,7 +161,7 @@ def _trigger_thumbnail_render(model_name):
 
 
 def _trigger_upload(model_name, is_reupload):
-    """Gets called by the task queue to upload a specific model using client_lib."""
+    """Gets called by the task queue to upload a specific model by invoking the main BlenderKit upload operator."""
     if not BLENDERKIT_AVAILABLE:
         return
 
@@ -275,122 +175,98 @@ def _trigger_upload(model_name, is_reupload):
         return
 
     print(
-        f"BlenderKit Batch: Preparing non-interactive upload for {model.name} (Reupload: {is_reupload})"
+        f"BlenderKit Batch: Triggering EXECUTE upload for {model.name} (Reupload: {is_reupload})"
     )
-    props = model.blenderkit
-    props.uploading = True
-    props.upload_state = "0% - Preparing data (batch)"
+    props = model.blenderkit  # Get props for status updates later
+
+    # --- Store current context ---+
+    original_mode = context.mode
+    original_active = context.view_layer.objects.active
+    original_selected_names = {o.name for o in context.selected_objects}
 
     try:
-        # --- Determine Upload Set ---+
-        upload_set = []
-        if not is_reupload:
-            upload_set = ["METADATA", "THUMBNAIL", "MAINFILE"]
-        else:
-            if batch_props.reupload_metadata:
-                upload_set.append("METADATA")
-            if batch_props.reupload_thumbnail:
-                upload_set.append("THUMBNAIL")
-            if batch_props.reupload_main_file:
-                upload_set.append("MAINFILE")
-
-        if not upload_set:
-            props.upload_state = "Skipped: No re-upload options selected."
-            props.uploading = False
-            print(
-                f"BlenderKit Batch: Skipping re-upload for {model_name}, no components selected."
-            )
-            return
-
-        # --- Prepare Data (Replicating parts of prepare_asset_data) ---+
-
-        # Check thumbnail if needed
-        if "THUMBNAIL" in upload_set and (
-            not props.thumbnail
-            or not bpy.path.abspath(props.thumbnail)
-            or not os.path.exists(bpy.path.abspath(props.thumbnail))
-        ):
-            props.upload_state = (
-                "Error: Thumbnail selected for upload but not found or path invalid."
-            )
-            props.uploading = False
-            print(
-                f"BlenderKit Batch: Upload error for {model_name} - Thumbnail missing."
-            )
-            return
-
-        # Get export and upload data dictionaries
-        export_data, upload_data = _get_model_upload_data(model, context)
-        if not export_data or not upload_data:
-            props.upload_state = "Error: Failed to gather upload data."
-            props.uploading = False
-            print(
-                f"BlenderKit Batch: Upload error for {model_name} - Data preparation failed."
-            )
-            return
-
-        # Set assetId for client_lib (expects 'assetId', not 'asset_base_id' or 'id')
-        # Use asset_base_id if reuploading, otherwise it should be empty/None for new.
-        upload_data["assetId"] = props.asset_base_id if is_reupload else None
-
-        # Save temporary file if uploading main file (like prepare_asset_data does)
-        temp_dir = None
-        if "MAINFILE" in upload_set:
-            # Check if file needs saving first? Main BK operator does.
-            if not bpy.data.filepath:
-                props.upload_state = "Error: Please save the main blend file first."
-                props.uploading = False
-                print(
-                    f"BlenderKit Batch: Upload error for {model_name} - Main file not saved."
-                )
-                return
+        # --- Set context for the operator ---+
+        # Ensure Object Mode
+        if context.mode != "OBJECT":
             try:
-                temp_dir = tempfile.mkdtemp()
-                _, ext = os.path.splitext(bpy.data.filepath)
-                if not ext:
-                    ext = ".blend"
-                source_filepath = os.path.join(
-                    temp_dir, f"export_{bk_paths.slugify(model.name)}{ext}"
-                )
-                # Save a copy of the *current* state
-                bpy.ops.wm.save_as_mainfile(
-                    filepath=source_filepath, compress=False, copy=True
-                )
-                export_data["source_filepath"] = source_filepath
-                export_data["temp_dir"] = temp_dir
-            except Exception as e:
-                props.upload_state = f"Error saving temp file: {e}"
-                props.uploading = False
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except RuntimeError as e:
                 print(
-                    f"BlenderKit Batch: Upload error for {model_name} - Failed to save temp file: {e}"
+                    f"BlenderKit Batch: Could not switch to Object Mode for {model_name}: {e}"
                 )
-                if temp_dir and os.path.exists(temp_dir):
-                    import shutil
+                # Optionally set error status on props if available
+                if props:
+                    props.upload_state = "Error: Cannot switch to Object Mode"
+                    props.uploading = False
+                return  # Cannot proceed
 
-                    shutil.rmtree(temp_dir)
-                return
+        # Set selection and active object
+        bpy.ops.object.select_all(action="DESELECT")
+        model.select_set(True)
+        # This is the crucial part for context
+        context.view_layer.objects.active = model
 
-        # --- Call Client Lib ---+
-        print(f"BlenderKit Batch: Calling client_lib.asset_upload for {model.name}")
-        props.upload_state = "1% - Sending to background uploader (batch)"
-        bk_client_lib.asset_upload(upload_data, export_data, upload_set)
-        # Note: Progress updates from here rely on the main BK timer checking client reports
-        # and updating the props based on the eval_paths we provided in export_data.
+        # --- Prepare operator properties ---+
+        op_props = {
+            "asset_type": "MODEL",  # Assuming MODEL
+            "reupload": is_reupload,
+            # Set components based on batch settings if reuploading, otherwise default to True for new
+            "metadata": batch_props.reupload_metadata if is_reupload else True,
+            "thumbnail": batch_props.reupload_thumbnail if is_reupload else True,
+            "main_file": batch_props.reupload_main_file if is_reupload else True,
+        }
+
+        print(
+            f"  - Attempting EXEC_DEFAULT: Reupload={op_props['reupload']}, Meta={op_props['metadata']}, Thumb={op_props['thumbnail']}, File={op_props['main_file']}"
+        )
+        # Use EXEC_DEFAULT for both new and re-uploads to try and bypass popups
+        bpy.ops.object.blenderkit_upload("EXEC_DEFAULT", **op_props)
 
     except Exception as e:
-        props.upload_state = f"Error: {e}"
-        props.uploading = False
         print(
-            f"BlenderKit Batch: Unexpected error during upload prep for {model.name}: {e}"
+            f"BlenderKit Batch: Error executing upload operator for {model.name}: {e}"
         )
         import traceback
 
         traceback.print_exc()
-        # Clean up temp dir if created
-        if "temp_dir" in locals() and temp_dir and os.path.exists(temp_dir):
-            import shutil
+        if props:
+            props.upload_state = f"Batch Upload Error: {e}"
+            props.uploading = False  # Try to reset status
 
-            shutil.rmtree(temp_dir)
+    finally:
+        # --- Attempt to restore original context ---+
+        # This might not be perfectly reliable across timed tasks
+        try:
+            # Restore selection first
+            bpy.ops.object.select_all(action="DESELECT")
+            for name in original_selected_names:
+                obj = bpy.data.objects.get(name)
+                if obj:
+                    obj.select_set(True)
+            # Restore active object
+            context.view_layer.objects.active = original_active
+            # Restore mode
+            if context.mode != original_mode:
+                try:
+                    # Need to check if the mode is valid in the current context
+                    if (
+                        original_mode == "EDIT"
+                        and context.view_layer.objects.active
+                        and context.view_layer.objects.active.type == "MESH"
+                    ):
+                        bpy.ops.object.mode_set(mode=original_mode)
+                    elif (
+                        original_mode != "EDIT"
+                    ):  # Avoid entering edit mode if active obj doesn't support it
+                        bpy.ops.object.mode_set(mode=original_mode)
+                except RuntimeError as mode_e:
+                    print(
+                        f"BlenderKit Batch: Warning - Could not restore mode to {original_mode}: {mode_e}"
+                    )
+        except Exception as restore_e:
+            print(
+                f"BlenderKit Batch: Warning - Failed to fully restore context after upload attempt for {model_name}: {restore_e}"
+            )
 
 
 class BlenderKitBatchProperties(PropertyGroup):
@@ -443,17 +319,6 @@ class BlenderKitBatchProperties(PropertyGroup):
         name="Main File",
         description="Re-upload the main asset .blend file or source file",
         default=True,
-    )  # type: ignore
-
-    # --- Upload Plan ---+
-    upload_plan: EnumProperty(
-        name="Upload Plan",
-        items=[
-            ("FULL", "Full Plan", "Upload assets to the Full Plan (default)"),
-            ("FREE", "Free", "Upload assets as Free for everyone"),
-        ],
-        description="Choose whether the batch-uploaded assets should be free or in the Full Plan",
-        default="FULL",
     )  # type: ignore
 
 
@@ -714,11 +579,6 @@ class BK_BATCH_PT_panel(Panel):
         reupload_col.prop(props, "reupload_metadata")
         reupload_col.prop(props, "reupload_thumbnail")
         reupload_col.prop(props, "reupload_main_file")
-
-        # --- Upload Settings ---+
-        upload_settings_box = layout.box()
-        upload_settings_box.label(text="Upload Settings:")
-        upload_settings_box.prop(props, "upload_plan", expand=True)
 
         # --- Actions ---+
         action_box = layout.box()
